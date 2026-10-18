@@ -705,9 +705,49 @@ class ReviewInput(BaseModel):
     trip: str = ""
     text: str
 
+# ---------- Reviews (Google auto-fetch + owner-managed) ----------
+
+GOOGLE_PLACES_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
+GOOGLE_PLACE_ID = os.environ.get("GOOGLE_PLACE_ID", "")
+_google_cache = {"ts": 0.0, "data": []}
+
+async def fetch_google_reviews():
+    if not (GOOGLE_PLACES_KEY and GOOGLE_PLACE_ID):
+        return []
+    now = datetime.now().timestamp()
+    if now - _google_cache["ts"] < 21600 and _google_cache["data"]:
+        return _google_cache["data"]
+    try:
+        url = (
+            "https://maps.googleapis.com/maps/api/place/details/json"
+            f"?place_id={GOOGLE_PLACE_ID}&fields=reviews&key={GOOGLE_PLACES_KEY}"
+        )
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url)
+        result = resp.json().get("result", {})
+        reviews = [
+            {
+                "id": f"g-{r.get('time', '')}",
+                "name": r.get("author_name", "Google user"),
+                "rating": r.get("rating", 5),
+                "trip": "Google review",
+                "text": r.get("text", ""),
+            }
+            for r in result.get("reviews", [])
+            if r.get("text")
+        ]
+        if reviews:
+            _google_cache.update({"ts": now, "data": reviews})
+        return reviews
+    except Exception as e:
+        logger.warning(f"Google reviews fetch failed: {e}")
+        return []
+
 @api_router.get("/reviews")
 async def get_reviews():
-    return await db.reviews.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    owner = await db.reviews.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    google = await fetch_google_reviews()
+    return google + owner
 
 @api_router.post("/admin/reviews")
 async def create_review(input: ReviewInput, user=Depends(get_current_user)):
