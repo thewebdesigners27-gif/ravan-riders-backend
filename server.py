@@ -337,6 +337,8 @@ class Vehicle(BaseModel):
     type: str  # "bike" | "car"
     category: str
     detail: str = ""
+    model_year: str = ""
+    quantity: int = 1
     image: str
     daily_rate: int
     weekly_rate: int
@@ -350,6 +352,8 @@ class VehicleInput(BaseModel):
     type: str
     category: str
     detail: str = ""
+    model_year: str = ""
+    quantity: int = 1
     image: str
     daily_rate: int
     weekly_rate: int
@@ -409,14 +413,21 @@ async def find_conflict(vehicle_id: str, p: datetime, r: datetime, exclude_id: O
     if exclude_id:
         query["id"] = {"$ne": exclude_id}
     existing = await db.bookings.find(query, {"_id": 0}).to_list(200)
+    count = 0
+    first = None
     for b in existing:
         if booking_expired(b):
             continue
         bp = parse_slot_dt(b["pickup_date"], b.get("pickup_time"))
         br = parse_slot_dt(b["return_date"], b.get("return_time"))
         if ranges_overlap(p, r, bp, br):
-            return b
-    return None
+            count += 1
+            first = first or b
+    if count == 0:
+        return None
+    vehicle = await db.fleet.find_one({"id": vehicle_id}, {"_id": 0, "quantity": 1})
+    quantity = (vehicle or {}).get("quantity") or 1
+    return first if count >= quantity else None
 
 @api_router.get("/fleet/availability")
 async def fleet_availability(pickup_date: str, return_date: str, pickup_time: str = "10:00", return_time: str = "10:00"):
@@ -454,6 +465,8 @@ class BookingInput(BaseModel):
 def validate_slot_range(input) -> tuple:
     p = parse_slot_dt(input.pickup_date, input.pickup_time)
     r = parse_slot_dt(input.return_date, input.return_time)
+    if p.date() < datetime.now().date():
+        raise HTTPException(status_code=400, detail="Pickup date cannot be in the past")
     if r <= p:
         raise HTTPException(status_code=400, detail="Return slot must be after pickup slot")
     return p, r
@@ -662,6 +675,64 @@ async def alert_status(user=Depends(get_current_user)):
         "whatsapp_number": CALLMEBOT_PHONE,
         "email_active": bool(OWNER_EMAIL),
     }
+
+
+# ---------- Site settings (owner-editable contact numbers) ----------
+
+DEFAULT_SETTINGS = {"phone_primary": "+919515488908", "phone_secondary": "", "whatsapp_number": "+919515488908"}
+
+@api_router.get("/settings")
+async def get_settings():
+    doc = await db.settings.find_one({"key": "site"})
+    s = dict(DEFAULT_SETTINGS)
+    if doc:
+        s.update({k: doc[k] for k in s if doc.get(k) is not None})
+    return s
+
+@api_router.put("/admin/settings")
+async def update_settings(request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    update = {k: str(body.get(k, "")).strip() for k in DEFAULT_SETTINGS}
+    await db.settings.update_one({"key": "site"}, {"$set": {**update, "key": "site"}}, upsert=True)
+    return update
+
+
+# ---------- Reviews (owner-managed) ----------
+
+class ReviewInput(BaseModel):
+    name: str
+    rating: int = 5
+    trip: str = ""
+    text: str
+
+@api_router.get("/reviews")
+async def get_reviews():
+    return await db.reviews.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+@api_router.post("/admin/reviews")
+async def create_review(input: ReviewInput, user=Depends(get_current_user)):
+    if not 1 <= input.rating <= 5:
+        raise HTTPException(status_code=400, detail="Rating must be 1 to 5")
+    review = {"id": str(uuid.uuid4()), **input.model_dump(), "created_at": datetime.now(timezone.utc).isoformat()}
+    await db.reviews.insert_one(review)
+    review.pop("_id", None)
+    return review
+
+@api_router.put("/admin/reviews/{review_id}")
+async def update_review(review_id: str, input: ReviewInput, user=Depends(get_current_user)):
+    if not 1 <= input.rating <= 5:
+        raise HTTPException(status_code=400, detail="Rating must be 1 to 5")
+    result = await db.reviews.update_one({"id": review_id}, {"$set": input.model_dump()})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Review not found")
+    return await db.reviews.find_one({"id": review_id}, {"_id": 0})
+
+@api_router.delete("/admin/reviews/{review_id}")
+async def delete_review(review_id: str, user=Depends(get_current_user)):
+    result = await db.reviews.delete_one({"id": review_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Review not found")
+    return {"deleted": True}
 
 
 @api_router.get("/")
